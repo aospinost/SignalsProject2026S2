@@ -1,0 +1,884 @@
+% =====================================================================
+%  Filter implementation report: HPSS, REPET (original) and REPET-SIM
+%  Signals Project -- Grupo 1, Ecualizador
+%  Compile with: pdflatex filters_implementation.tex  (run twice)
+% =====================================================================
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage[margin=2.3cm]{geometry}
+\usepackage{amsmath,amssymb,mathtools}
+\usepackage{booktabs,tabularx,multirow,array}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{xcolor}
+\usepackage{enumitem}
+\usepackage[hidelinks]{hyperref}
+\usepackage{cleveref}
+
+\newcolumntype{L}{>{\raggedright\arraybackslash}X}
+\newcommand{\code}[1]{\texttt{#1}}
+\newcommand{\R}{\mathbb{R}}
+\DeclareMathOperator*{\median}{median}
+\DeclareMathOperator{\STFT}{STFT}
+\DeclareMathOperator{\ISTFT}{ISTFT}
+
+\newenvironment{deviation}{\par\smallskip\noindent\textbf{Deviation.}\ }{\par\smallskip}
+
+\title{Implementation of the Separation Filters:\\
+HPSS, Original REPET and REPET-SIM}
+\author{Signals Project --- Grupo 1 (Ecualizador)}
+\date{November 2026}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+This document describes how the three time--frequency filters of the
+equalizer are implemented in MATLAB, equation by equation, and how each
+implementation relates to the paper it comes from: median-filtering
+harmonic/percussive separation (HPSS) by FitzGerald~\cite{fitzgerald2010},
+and the original REPET and REPET-SIM by Rafii, Liutkus and
+Pardo~\cite{rafii2014,rafii2013,rafii2012}. It covers the shared STFT
+front end, the meaning of each user parameter and its conversion from
+physical units, the resulting masks, the way the masks are combined into a
+musical component, and every point where the code deliberately departs
+from the papers or from the authors' reference code. The gain stage and the
+energy measurement are out of scope and will be documented separately.
+\end{abstract}
+
+\tableofcontents
+\bigskip
+
+% =====================================================================
+\section{Scope and notation}
+% =====================================================================
+
+The equalizer boosts or attenuates a \emph{musical component} (e.g.\ the
+lead voice, the percussion, the harmonic accompaniment) of a stereo song.
+A component is not separated as a stand-alone track; it is described by a
+time--frequency mask $M\in[0,1]$ that weights every STFT bin of every
+channel. Two independent filters provide the information used to build that
+mask:
+
+\begin{itemize}[nosep]
+  \item \textbf{Character}: HPSS classifies each bin as \emph{sustained}
+        (harmonic) or \emph{percussive}.
+  \item \textbf{Repetition}: either the original REPET or REPET-SIM
+        (selected globally in the interface) classifies each bin as part of a
+        \emph{repeating} background or of a \emph{non-repeating} foreground.
+\end{itemize}
+
+None of the filters uses machine learning or pre-trained models: all three
+are built from the STFT, median filters and element-wise operations, and
+all of them are implemented from scratch without any MATLAB toolbox.
+
+\paragraph{Notation.} Throughout the document:
+
+\begin{center}
+\begin{tabularx}{\linewidth}{@{}lL@{}}
+\toprule
+Symbol & Meaning \\
+\midrule
+$x_c[\nu]$ & channel $c\in\{1,\dots,C\}$ of the fragment, $C=1$ or $2$, sampling rate $f_s$ \\
+$N_w$, $R$ & window/FFT length and hop size [samples] \\
+$X_c(i,j)$ & complex STFT of channel $c$, bin $i=1,\dots,n$ ($n=N_w/2+1$), frame $j=1,\dots,m$ \\
+$V_c(i,j)$ & magnitude spectrogram $|X_c(i,j)|$ (the \code{F.Vch} array, size $n\times m\times C$) \\
+$\bar V(i,j)$ & channel average $\frac1C\sum_c V_c(i,j)$ (\code{mean(V,3)}) \\
+$\Delta f=f_s/N_w$ & bin spacing [Hz]; $\Delta t=R/f_s$ frame spacing [s] \\
+$M_H$, $M_P$ & HPSS sustained and percussive masks, $M_P=1-M_H$ \\
+$M_R$ & REPET background (repeating) mask; $1-M_R$ is the foreground \\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+FitzGerald indexes bins by $h$ and frames by $i$; the REPET chapter uses
+$i$ for bins and $j$ for frames. This document follows the REPET convention
+($i$ = bin, $j$ = frame) for all three filters. MATLAB identifiers are
+quoted as they appear in the code (in Spanish).
+
+\paragraph{Source files.}
+\begin{center}
+\begin{tabularx}{\linewidth}{@{}lL@{}}
+\toprule
+File & Role \\
+\midrule
+\code{core/ventana\_hann.m} & periodic Hann window \\
+\code{core/calcular\_stft.m}, \code{core/calcular\_istft.m} & STFT and WOLA inverse \\
+\code{core/caracteristicas\_tf.m} & STFT of each channel and magnitudes, once per fragment \\
+\code{core/hpss\_mascara.m} & HPSS mask, FitzGerald (2010) \\
+\code{core/repet\_mascara.m} & original REPET mask, Rafii et al.\ (2014) \S14.2 \\
+\code{core/repet\_sim\_mascara.m} & REPET-SIM mask, Rafii et al.\ (2014) \S14.4 \\
+\code{core/rampa\_coseno.m} & raised-cosine band/pan edges \\
+\code{core/mascara\_componente.m} & product of the masks that defines a component \\
+\code{core/aplicar\_componentes.m} & applies the component masks and inverts (gain stage) \\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+% =====================================================================
+\section{Shared time--frequency front end}
+\label{sec:stft}
+% =====================================================================
+
+All three filters operate on the \emph{same} STFT. This is not a
+convenience: the masks are multiplied bin by bin
+(\cref{sec:combination}), so they must live on the same time--frequency
+grid.
+
+\subsection{Analysis window}
+\code{ventana\_hann} returns the \emph{periodic} Hann window
+\begin{equation}
+  w[\nu] = \tfrac12 - \tfrac12\cos\!\left(\frac{2\pi \nu}{N_w}\right),
+  \qquad \nu = 0,\dots,N_w-1 .
+\end{equation}
+The periodic (rather than symmetric) form is used because shifted copies
+of it at hops $R=N_w/2$ or $N_w/4$ add up to a constant, which keeps the
+normalisation of the inverse transform well conditioned.
+
+\subsection{Forward STFT (\code{calcular\_stft})}
+\begin{enumerate}[nosep]
+  \item The signal is zero-padded with $N_w/2$ samples at the start and
+        $N_w/2+N_w$ at the end, so that frame $j$ is \emph{centred} on
+        sample $(j-1)R$ of the original signal.
+  \item The number of frames is $m=\lceil (N-1)/R\rceil+1$, so the last
+        frame is centred at or after the last sample and every sample is
+        covered by frames on both sides.
+  \item Each frame is multiplied by $w$, transformed with an $N_w$-point
+        FFT, and only the non-negative frequencies are kept:
+        $n=N_w/2+1$ bins at $f_i=(i-1)\Delta f$.
+\end{enumerate}
+The frames are built at once with an index matrix
+(\code{idx = (1:Nw)' + (0:nTramas-1)*hop}), so the whole STFT is a single
+vectorised FFT call.
+
+\subsection{Inverse STFT (\code{calcular\_istft})}
+The inverse is weighted overlap--add (WOLA): every frame is rebuilt from
+its Hermitian-symmetric spectrum, inverse-transformed (\code{'symmetric'}
+flag, so the output is exactly real), multiplied again by the synthesis
+window and added at its position; the sum is divided by the overlap of the
+squared windows:
+\begin{equation}
+  y[\nu] = \frac{\sum_j w[\nu-(j-1)R]\;\mathcal{F}^{-1}\{Y_j\}[\nu-(j-1)R]}
+                {\sum_j w^2[\nu-(j-1)R]} .
+  \label{eq:wola}
+\end{equation}
+If $Y=X$ (no modification) this returns $x$ exactly (round-off of order
+$10^{-15}$). If $Y$ has been masked, \cref{eq:wola} is the Griffin--Lim
+least-squares estimate~\cite{griffin1984}: the signal whose STFT is closest
+to the modified one. Two properties are used later:
+\begin{itemize}[nosep]
+  \item \textbf{Linearity}: $\ISTFT(aY_1+bY_2)=a\ISTFT(Y_1)+b\ISTFT(Y_2)$.
+        Hence the REPET foreground, which the paper obtains as
+        ``mixture minus background'' in the time domain, is identical to
+        applying the mask $1-M_R$.
+  \item \textbf{Exact reconstruction}: masks that add up to one in every bin
+        reconstruct the original signal exactly.
+\end{itemize}
+
+\subsection{Default parameters}
+The default STFT is a Hann window of $N_w=4096$ samples with $75\,\%$
+overlap ($R=1024$), which is the setting used by FitzGerald~\cite{fitzgerald2010}
+(FFT 4096, hop 1024 at 44.1~kHz), who also reports better separation with
+longer FFTs. The REPET papers do not prescribe a window (see
+\cref{sec:deviations}). Window and overlap can be changed in the
+interface panel \emph{``An\'alisis STFT (afecta el procesamiento)''}; all
+filter parameters are entered in seconds or hertz and re-converted, so
+their physical meaning does not change.
+
+\begin{table}[htbp]
+\centering
+\caption{Resolution of the default STFT (Hann 4096, hop 1024).}
+\label{tab:stft}
+\begin{tabular}{@{}lcc@{}}
+\toprule
+Quantity & $f_s=48$ kHz & $f_s=44.1$ kHz \\
+\midrule
+Bin spacing $\Delta f=f_s/N_w$ & 11.7 Hz & 10.8 Hz \\
+Window duration $N_w/f_s$ & 85.3 ms & 92.9 ms \\
+Hop $\Delta t=R/f_s$ & 21.3 ms & 23.2 ms \\
+Hann main lobe ($4\Delta f$) & 46.9 Hz & 43.1 Hz \\
+Frames in a 20 s fragment, $m$ & 939 & 863 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Per-fragment features (\code{caracteristicas\_tf})}
+For a fragment of size $N\times C$ this function computes, once:
+the STFT $X_c$ of each channel (stored in single precision), the
+magnitudes $V_c=|X_c|$ stacked as an $n\times m\times C$ array
+(\code{F.Vch}, the input of all three filters), the mono power
+$|(X_1+X_2)/2|^2$ (for display), and a panning index
+$p(i,j)=(|X_R|-|X_L|)/(|X_R|+|X_L|)\in[-1,1]$. The HPSS and REPET masks are
+computed afterwards, so that their parameters can be changed without
+recomputing the STFT.
+
+% =====================================================================
+\section{Common masking framework}
+\label{sec:combination}
+% =====================================================================
+
+\subsection{Per-channel masks}
+Each filter receives $V$ ($n\times m\times C$) and returns a mask of the
+same size, i.e.\ \emph{one mask per channel}. Where a filter needs a single
+decision for both channels (the REPET period and the REPET-SIM similarity
+matrix), that decision is taken on the channel average $\bar V$, and the
+mask itself is then built from each $V_c$ separately, as in the authors'
+reference code.
+
+\subsection{Complementary pairs}
+Each filter produces a mask and its complement:
+\begin{equation}
+  M_P = 1-M_H, \qquad M_{\text{fg}} = 1-M_R .
+\end{equation}
+HPSS gives a \emph{binary} mask ($M_H\in\{0,1\}$, FitzGerald eqs.~8--9),
+both REPET variants give a \emph{soft} mask ($M_R\in[0,1]$, Rafii eq.~14.4).
+The masks are used exactly as the papers define them: no thresholding,
+sharpening, or frequency cut-off is applied inside the filters.
+
+\subsection{Component mask (\code{mascara\_componente})}
+A component is the product of four independent cues:
+\begin{equation}
+  M(i,j,c) = M_{\text{band}}(i)\cdot M_{\text{char}}(i,j,c)\cdot
+             M_{\text{rep}}(i,j,c)\cdot M_{\text{pan}}(i,j),
+  \label{eq:component}
+\end{equation}
+where
+\begin{itemize}[nosep]
+  \item $M_{\text{band}}$ is 1 inside $[f_1,f_2]$ with raised-cosine
+        edges of width \code{suavF} (\code{rampa\_coseno});
+  \item $M_{\text{char}}\in\{1,\;M_H,\;1-M_H\}$ for
+        \emph{cualquiera / sostenido / percusivo};
+  \item $M_{\text{rep}}\in\{1,\;M_R,\;1-M_R\}$ for
+        \emph{cualquiera / repetitivo / norepetitivo};
+  \item $M_{\text{pan}}$ selects a panning range with cosine edges; it is
+        only applied when the fragment is truly stereo (inter-channel
+        correlation $<0.99$).
+\end{itemize}
+The cosine edges matter: multiplying the spectrum by a rectangular band is
+a convolution with a sinc in time and produces audible ringing.
+
+\subsection{Partition of unity}
+Because every cue comes as a complementary pair, the four
+character~$\times$~repetition combinations add up to one in every bin:
+\begin{equation}
+  M_HM_R + M_H(1-M_R) + (1-M_H)M_R + (1-M_H)(1-M_R) = 1 .
+  \label{eq:unity}
+\end{equation}
+By the exact-reconstruction property of the WOLA inverse, the four
+components played together give back the original signal. This is an
+invariant of the design and is checked by the tests (\cref{sec:tests}).
+The typical lead-voice component is \emph{Sostenido $\times$ No repetitivo},
+i.e.\ $M = M_H(1-M_R)$: a product of a binary and a soft mask.
+
+\subsection{Interface with the gain stage}
+\code{aplicar\_componentes} consumes these masks: the processed STFT of
+channel $c$ is $Y_c = G(\cdot,\cdot,c)\odot X_c$ with a per-bin gain built
+from the component masks, and $y_c=\ISTFT(Y_c)$. The design of the gain
+law and its energy measurement are outside the scope of this document.
+
+% =====================================================================
+\section{HPSS: harmonic/percussive separation by median filtering}
+\label{sec:hpss}
+% =====================================================================
+\noindent\textit{Reference: FitzGerald (2010)~\cite{fitzgerald2010}.
+Code: \code{core/hpss\_mascara.m}.}
+
+\subsection{Principle}
+In a spectrogram, a stationary pitched sound (a held note, a vowel) is a
+\emph{horizontal} ridge: energy that stays in the same bin across many
+frames. A percussive onset is a \emph{vertical} ridge: energy spread over
+many bins during very few frames. FitzGerald's observation is that each
+kind of event is an \emph{outlier} in the direction in which the other one
+is smooth:
+\begin{itemize}[nosep]
+  \item along \emph{time}, in a fixed bin, a drum hit is a short spike on
+        top of the slowly-varying harmonic energy;
+  \item along \emph{frequency}, in a fixed frame, a harmonic is a narrow
+        spike on top of the broadband percussive energy.
+\end{itemize}
+A median filter removes outliers that occupy less than half of its window,
+so median filtering in each direction suppresses one class and keeps the
+other. This replaces the iterative diffusion of Ono et al.\ with two
+non-iterative passes.
+
+\subsection{Equations}
+\paragraph{Median filter (eq.~5).} For odd length $l$,
+\begin{equation}
+  y(\nu) = \median\{x(\nu-k), \dots, x(\nu+k)\}, \qquad k=\frac{l-1}{2}.
+\end{equation}
+
+\paragraph{Percussion-enhanced spectrogram (eq.~6).} Each frame $j$ is
+median-filtered \emph{across frequency} with length $l_{\text{perc}}$:
+\begin{equation}
+  P(:,j) = \mathcal{M}\{V(:,j),\, l_{\text{perc}}\}.
+\end{equation}
+
+\paragraph{Harmonic-enhanced spectrogram (eq.~7).} Each bin $i$ is
+median-filtered \emph{across time} with length $l_{\text{harm}}$:
+\begin{equation}
+  H(i,:) = \mathcal{M}\{V(i,:),\, l_{\text{harm}}\}.
+\end{equation}
+
+\paragraph{Binary masks (eqs.~8--9).}
+\begin{equation}
+  M_H(i,j)=\begin{cases}1 & H(i,j)>P(i,j)\\ 0&\text{otherwise}\end{cases},
+  \qquad
+  M_P(i,j)=\begin{cases}1 & P(i,j)>H(i,j)\\ 0&\text{otherwise}\end{cases}.
+\end{equation}
+
+\paragraph{Soft (Wiener) masks (eqs.~10--11), not implemented yet.}
+\begin{equation}
+  M_H = \frac{H^p}{H^p+P^p}, \qquad M_P=\frac{P^p}{H^p+P^p},\qquad p\in\{1,2\}.
+\end{equation}
+
+\paragraph{Resynthesis (eqs.~12--13).} The masks multiply the original
+\emph{complex} STFT, $\hat H = X\odot M_H$, $\hat P = X\odot M_P$, which are
+then inverted.
+
+\subsection{Implementation}
+The function signature is
+\begin{center}\code{[Marm, Lt, Lf] = hpss\_mascara(V, fs, Nw, hop, tArm, fPerc, tipo)}\end{center}
+
+\begin{algorithm}[htbp]
+\caption{HPSS mask (\code{hpss\_mascara})}
+\begin{algorithmic}[1]
+\Require $V\in\R_{\ge0}^{n\times m\times C}$, $f_s$, $N_w$, $R$,
+         $t_{\text{arm}}$ [s], $f_{\text{perc}}$ [Hz]
+\State $L_t \gets \mathrm{odd}\big(\max(3,\ \mathrm{round}(t_{\text{arm}} f_s/R))\big)$
+       \Comment{$l_{\text{harm}}$ in frames}
+\State $L_f \gets \mathrm{odd}\big(\max(3,\ \mathrm{round}(f_{\text{perc}} N_w/f_s))\big)$
+       \Comment{$l_{\text{perc}}$ in bins}
+\State $H \gets$ \code{movmedian(V, Lt, 2)} \Comment{along time, every bin and channel (eq.~7)}
+\State $P \gets$ \code{movmedian(V, Lf, 1)} \Comment{along frequency, every frame and channel (eq.~6)}
+\State $M_H \gets [H > P]$ (single, values 0/1) \Comment{eq.~8}
+\State \Return $M_H$ \Comment{$M_P = 1-M_H$ is formed in \code{mascara\_componente}}
+\end{algorithmic}
+\end{algorithm}
+
+Here $\mathrm{odd}(l)$ adds one when $l$ is even, so that the filter has a
+well-defined centre sample as eq.~5 requires. Because \code{movmedian}
+operates along one dimension of the full 3-D array, both channels are
+processed in the same call and each channel gets its own mask.
+
+\subsection{Parameters}
+The paper uses $17\times17$ filters at FFT 4096, hop 1024, 44.1~kHz, and
+reports that separation quality ``did not vary dramatically'' for lengths
+between 15 and 30. The code takes the lengths in physical units, chosen to
+reproduce $17\times17$ at the paper's setting:
+\begin{equation}
+  17\ \text{frames}\times 23.2\ \text{ms}\approx 400\ \text{ms},\qquad
+  17\ \text{bins}\times 10.8\ \text{Hz}\approx 180\ \text{Hz}.
+\end{equation}
+
+\begin{table}[htbp]
+\centering
+\caption{HPSS parameters (default STFT).}
+\label{tab:hpss}
+\begin{tabularx}{\linewidth}{@{}p{2.6cm}cccL@{}}
+\toprule
+Parameter & Default & 48 kHz & 44.1 kHz & UI range \\
+\midrule
+Time median $l_{\text{harm}}$ (\code{tArm}) & 400 ms & 19 frames (405 ms) & 17 frames (395 ms) & 100--1500 ms \\
+Freq.\ median $l_{\text{perc}}$ (\code{fPerc}) & 180 Hz & 15 bins (176 Hz) & 17 bins (183 Hz) & 50--1000 Hz \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\paragraph{What each parameter does.} A median keeps whatever occupies
+more than half of its window. Therefore:
+\begin{itemize}
+  \item $l_{\text{harm}}$ is roughly \emph{twice the minimum duration} an
+        event must have to be called sustained. Increasing it (e.g.\ 800 ms)
+        makes only long notes sustained: short syllables, fast melodic
+        passages and vibrato move to the percussive side. Decreasing it
+        (e.g.\ 200 ms) lets cymbal tails and resonant hits become sustained,
+        so percussion leaks into the sustained component.
+  \item $l_{\text{perc}}$ is roughly \emph{twice the minimum bandwidth} an
+        event must have to be called percussive. Increasing it gives a
+        smoother percussive estimate and pushes broad partials (chorus,
+        vibrato) towards the sustained side; decreasing it lets wide
+        harmonic lobes or dense chords be called percussive.
+\end{itemize}
+For the sensitivity sweep of the report, the paper's stable range
+15--30 corresponds at 48 kHz to approximately 320--640 ms and
+176--352 Hz.
+
+\subsection{Implementation decisions relative to the paper}
+\begin{enumerate}
+  \item \textbf{Ties.} Eqs.~8--9 leave bins with $H=P$ in \emph{neither}
+        class ($M_H=M_P=0$). In practice ties happen in digital silence
+        ($H=P=0$). The code defines $M_P=1-M_H$, which sends ties to the
+        percussive side and keeps the partition of unity
+        (\cref{eq:unity}) exact.
+  \item \textbf{Borders.} The paper does not say how the median behaves at
+        the edges of the spectrogram. \code{movmedian} uses its default
+        \code{'shrink'} mode: near the first/last frame and near 0~Hz and
+        Nyquist the window is truncated to the available samples.
+  \item \textbf{Stereo.} The paper treats mono signals and notes the
+        method ``can easily be extended to handle stereo''. Here it is
+        applied to each channel independently.
+  \item \textbf{Binary mask.} The paper observes that the soft mask with
+        $p=2$ produces fewer artefacts at the cost of slightly more
+        interference, and that $p=2$ is considerably better than $p=1$.
+        The current code implements only the binary mask; the argument
+        \code{tipo} is reserved for the soft variant.
+\end{enumerate}
+
+\subsection{Expected behaviour and limitations}
+\begin{itemize}
+  \item \textbf{Musical noise.} A binary mask switches bins fully on or off,
+        so isolated bins flip between classes from frame to frame. With large
+        gains ($\pm18$--$20$ dB) this becomes audible as ``musical noise''
+        and hard spectral edges.
+  \item \textbf{Low notes.} With $N_w=4096$ at 48~kHz the Hann main lobe of
+        a single partial spans about 4 bins ($\approx47$ Hz). When the
+        fundamental is below about 95~Hz (bass notes E1--G2), consecutive
+        harmonics are closer than two main lobes and occupy more than half
+        of the 15-bin frequency window, so part of a sustained bass note is
+        classified as percussive.
+  \item \textbf{Attacks.} Note onsets of plucked or struck instruments
+        (guitar, piano, bass) are broadband and short: they are correctly,
+        but often undesirably, assigned to the percussive side, as the paper
+        itself reports.
+  \item \textbf{Pitch glides.} Sung vibrato and slides are not horizontal;
+        energy that moves by more than a bin within $l_{\text{harm}}/2$
+        leaks to the percussive side.
+\end{itemize}
+Cost: two moving medians over the spectrogram, $O(nm\,(l_{\text{harm}}+l_{\text{perc}}))$
+in the worst case; it is the cheapest of the three filters.
+
+% =====================================================================
+\section{Original REPET: repetition with a single period}
+\label{sec:repet}
+% =====================================================================
+\noindent\textit{References: Rafii and Pardo (2013)~\cite{rafii2013};
+Rafii, Liutkus and Pardo (2014), \S14.2~\cite{rafii2014}.
+Code: \code{core/repet\_mascara.m}.}
+
+\subsection{Principle}
+Popular music is frequently a varying foreground (the voice) laid over a
+background that repeats with a fixed period (a bar, a drum loop, a chord
+cycle). If that period $p$ is known, the spectrogram can be cut into
+segments of $p$ frames; at corresponding positions the background is the
+same in every segment, while the voice appears in only some of them. The
+element-wise median across segments therefore keeps the background and
+rejects the voice as an outlier. The method has three stages: (1) find the
+period, (2) model a repeating segment, (3) extract the repeating structure
+with a soft mask.
+
+\subsection{Equations}
+\paragraph{Beat spectrum (eq.~14.1).} With $V^2$ the power spectrogram
+(averaged over channels for stereo),
+\begin{equation}
+  A(i,l) = \frac{1}{m-l+1}\sum_{j=1}^{m-l+1} V(i,j)^2\,V(i,j+l-1)^2,
+  \qquad
+  b(l) = \frac1n\sum_{i=1}^{n} A(i,l),\qquad b(l)\leftarrow \frac{b(l)}{b(1)} .
+\end{equation}
+$A$ is the \emph{unbiased} autocorrelation over time of each frequency row
+of $V^2$; $b$ is its mean over frequency. The squaring emphasises the
+periodicity peaks. Lag $l=1$ in the paper's 1-based notation is lag 0.
+
+\paragraph{Period.} The paper accepts any ``period finder''; the
+reference code takes the maximum of $b$ inside a given lag range.
+
+\paragraph{Repeating segment model (eq.~14.2).} With $r$ segments of
+length $p$,
+\begin{equation}
+  S(i,j) = \median_{k=1\dots r} V\big(i,\, j+(k-1)p\big),\qquad j=1,\dots,p .
+\end{equation}
+
+\paragraph{Repeating spectrogram model (eq.~14.3).}
+\begin{equation}
+  W\big(i,j+(k-1)p\big) = \min\Big(S(i,j),\ V\big(i,j+(k-1)p\big)\Big).
+\end{equation}
+Since $V$ is assumed to be the sum of a non-negative background $W$ and a
+non-negative foreground $V-W$, the background cannot exceed the mixture.
+
+\paragraph{Soft mask (eq.~14.4).}
+\begin{equation}
+  M(i,j)=\frac{W(i,j)}{V(i,j)}\in[0,1].
+  \label{eq:softmask}
+\end{equation}
+The paper notes that a binary mask (threshold on $M$) is possible but that
+pilot experiments favoured the soft one.
+
+\subsection{Implementation}
+Signature: \code{[Mrep, info] = repet\_mascara(V, fs, hop, rangoPeriodo)}.
+
+\begin{algorithm}[htbp]
+\caption{Original REPET mask (\code{repet\_mascara})}
+\begin{algorithmic}[1]
+\Require $V\in\R_{\ge0}^{n\times m\times C}$, $f_s$, $R$, $[p_{\min},p_{\max}]$ [s]
+\State $Q \gets \bar V^{\,2}$ \Comment{\code{mean(V,3).\^{}2}, $n\times m$}
+\State $A \gets \mathcal F^{-1}\big\{|\mathcal F_{2m}\{Q(i,:)\}|^2\big\}$ for every row $i$
+       \Comment{linear autocorrelation via zero-padded FFT}
+\State $A(i,l) \gets A(i,l)/(m-l)$ for lags $l=0,\dots,m-1$ \Comment{unbiased}
+\State $b \gets \frac1n\sum_i A(i,:)$;\quad $b\gets b/(b(0)+\varepsilon)$
+\State $[l_{\text{lo}},l_{\text{hi}}] \gets \mathrm{round}([p_{\min},p_{\max}]\,f_s/R)$;\quad
+       $l_{\text{lo}}\gets\max(1,l_{\text{lo}})$;\quad $l_{\text{hi}}\gets\min(l_{\text{hi}},\lfloor m/3\rfloor)$
+\If{$l_{\text{hi}}<l_{\text{lo}}$} \Comment{fragment too short for 3 periods}
+   \State $l_{\text{hi}}\gets\min(\max(l_{\text{hi}}^{\text{orig}},l_{\text{lo}}),\,m-1)$;\quad $l_{\text{lo}}\gets\min(l_{\text{lo}},l_{\text{hi}})$
+\EndIf
+\State $p \gets \arg\max_{l\in[l_{\text{lo}},l_{\text{hi}}]} b(l)$;\quad $r\gets\lceil m/p\rceil$
+\For{$c=1,\dots,C$}
+   \State pad $V_c$ with NaN to $rp$ frames and reshape to $n\times p\times r$
+   \State $S \gets$ \code{median(.,3,'omitnan')} \Comment{eq.~14.2}
+   \State $W \gets \min(V_c, S)$ \Comment{eq.~14.3, segment by segment}
+   \State $M_R(:,:,c) \gets (W+\varepsilon)/(V_c+\varepsilon)$, truncated to $m$ frames \Comment{eq.~14.4}
+\EndFor
+\State \Return $M_R$, diagnostics $(b,\,p,\,p\Delta t,\,r,\,60/(p\Delta t))$
+\end{algorithmic}
+\end{algorithm}
+
+\paragraph{Notes on the steps.}
+\begin{itemize}
+  \item \textbf{Autocorrelation via FFT.} By the Wiener--Khinchin theorem,
+        the inverse FFT of $|\mathcal F\{q\}|^2$ is the autocorrelation of $q$.
+        A plain $m$-point FFT would give the \emph{circular} autocorrelation
+        (lag $l$ would also correlate the end of the fragment with its
+        beginning); zero-padding to $2m$ makes it linear. Dividing lag $l$
+        by $m-l$ (the number of overlapping terms) is exactly the
+        $1/(m-l+1)$ factor of eq.~14.1 in 0-based lags. This gives the
+        $O(m\log m)$ cost quoted in the chapter.
+  \item \textbf{Upper limit $\lfloor m/3\rfloor$.} As in the reference
+        code, the period cannot exceed a third of the fragment, so that at
+        least three segments enter the median. With fewer than three
+        values a median cannot reject an outlier.
+  \item \textbf{Partial last segment.} When $m$ is not a multiple of $p$,
+        the last segment is incomplete; padding with NaN and using
+        \code{'omitnan'} makes the median at those positions use only the
+        segments that exist. \code{min} ignores NaN as well, and the padded
+        columns are discarded at the end.
+  \item \textbf{$\varepsilon$ in the mask.} $\varepsilon$ is MATLAB's
+        \code{eps} ($2.2\times10^{-16}$), as in the reference code. It
+        avoids $0/0$: a silent bin gets $M=1$ (``background''), which is
+        harmless because $X=0$ there.
+\end{itemize}
+
+\subsection{Parameters}
+\begin{table}[htbp]
+\centering
+\caption{Original REPET parameters.}
+\label{tab:repet}
+\begin{tabularx}{\linewidth}{@{}p{2.6cm}ccL@{}}
+\toprule
+Parameter & Default & UI range & Effect \\
+\midrule
+Minimum period $p_{\min}$ & 1 s & 0.1--30 s & Shortest lag allowed. Raising it skips the beat and selects a bar or a phrase. Lowering it allows the beat or a subdivision; if the voice lasts longer than that period it is copied into the model and treated as background. \\
+Maximum period $p_{\max}$ & 10 s & 0.1--30 s, and $\le m/3$ & Longest lag allowed. Raising it allows long phrases but reduces $r$. Lowering it forces short periods; if the true pattern is longer, the median mixes different parts of the pattern. \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+The defaults $[1,10]$ s are those of the authors' reference code. Note that
+the $m/3$ limit dominates for the 20 s fragments of the assignment: with
+$m=939$ frames at 48 kHz, $\lfloor m/3\rfloor=313$ frames $=6.7$ s, so the
+effective search range is $[1,6.7]$ s, not $[1,10]$ s.
+
+\paragraph{Diagnostics shown in the interface.} The selected period in
+seconds and frames, the number of segments $r$ (including the partial
+one), and the \emph{equivalent BPM} $60/(p\,\Delta t)$, together with
+$\times2$ and $\times4$, because $p$ is usually a bar (2 or 4 beats) rather
+than a single beat. A warning is shown when $r<3$. The button
+\emph{``Ver espectro de ritmo''} plots $b(l)$ with the search range shaded
+and the chosen period and its multiples marked.
+
+\subsection{Limitations}
+\begin{itemize}
+  \item A single period for the whole fragment: tempo changes or a change
+        of section (verse $\to$ chorus) break the model. This is what the
+        adaptive REPET (\S14.3, not implemented) and REPET-SIM address.
+  \item In the unbiased beat spectrum the multiples $2p,3p,\dots$ have
+        peaks of similar height, so the maximum may be a multiple of the
+        musically ``right'' period. The separation remains valid while
+        $r\ge3$, but the beat-spectrum plot should be checked.
+  \item A repeated vocal phrase (a chorus sung identically every period) is
+        background by construction.
+\end{itemize}
+
+% =====================================================================
+\section{REPET-SIM: repetition through the similarity matrix}
+\label{sec:repetsim}
+% =====================================================================
+\noindent\textit{References: Rafii and Pardo (2012)~\cite{rafii2012};
+Rafii, Liutkus and Pardo (2014), \S14.4~\cite{rafii2014}.
+Code: \code{core/repet\_sim\_mascara.m}.}
+
+\subsection{Principle}
+REPET-SIM drops the assumption of a period. For every frame $j$ it finds
+the frames that \emph{look most like it} anywhere in the fragment, and
+takes the median over them. Background material repeats (not necessarily
+periodically), so it is present in most of those frames and survives the
+median; the foreground is present in few of them and is rejected.
+
+\emph{Example.} A 440 Hz bin over five similar frames has magnitudes
+$[0.30,0.31,0.29,\mathbf{0.90},0.30]$; the voice is only in the fourth
+frame. The median is $0.30$, so in that frame the mask is
+$0.30/0.90=0.33$: 33\,\% background, 67\,\% foreground.
+
+\subsection{Equations}
+\paragraph{Similarity matrix (eq.~14.8).} Cosine similarity between
+frames:
+\begin{equation}
+  S(j_a,j_b)=\frac{\sum_i V(i,j_a)V(i,j_b)}
+  {\sqrt{\sum_i V(i,j_a)^2}\sqrt{\sum_i V(i,j_b)^2}},
+  \qquad j_a,j_b=1,\dots,m .
+\end{equation}
+
+\paragraph{Repeating frames.} For each frame $j$, the indices $J_j$ of
+the most similar frames are kept, subject to three parameters: a minimum
+similarity $t$, a minimum distance $d$ between two selected frames, and a
+maximum number $k$ of selected frames.
+
+\paragraph{Initial model (eq.~14.9).}
+\begin{equation}
+  U(i,j)=\median_{l=1\dots k} V\big(i,J_j(l)\big).
+\end{equation}
+
+\paragraph{Refined model (eq.~14.7) and mask (eq.~14.4).}
+$W=\min(U,V)$ and $M=W/V$, exactly as in \cref{eq:softmask}.
+
+\subsection{Implementation}
+Signature: \code{[Mrep, info] = repet\_sim\_mascara(V, fs, hop, k, d, t)}.
+
+\begin{algorithm}[htbp]
+\caption{REPET-SIM mask (\code{repet\_sim\_mascara})}
+\begin{algorithmic}[1]
+\Require $V\in\R_{\ge0}^{n\times m\times C}$, $f_s$, $R$, $k$, $d$ [s], $t$
+\State $D\gets\max(1,\mathrm{round}(d\,f_s/R))$ \Comment{minimum distance in frames}
+\State $\tilde V(:,j) \gets \bar V(:,j)/(\|\bar V(:,j)\|_2+\varepsilon)$ (single)
+\State $S\gets \tilde V^{\mathsf T}\tilde V$ \Comment{$m\times m$ cosine matrix, eq.~14.8}
+\For{$j=1,\dots,m$}
+   \State $J_j \gets \textsc{Peaks}\big(S(:,j),\,t,\,D,\,k\big)$
+   \If{$J_j=\emptyset$} $J_j\gets\{j\}$ \EndIf
+\EndFor
+\For{$c=1,\dots,C$}
+   \State $U(:,j)\gets\median V_c(:,J_j)$ for every $j$ \Comment{eq.~14.9}
+   \State $W\gets\min(U,V_c)$ \Comment{eq.~14.7}
+   \State $M_R(:,:,c)\gets(W+\varepsilon)/(V_c+\varepsilon)$ \Comment{eq.~14.4}
+\EndFor
+\State \Return $M_R$ and diagnostics
+\end{algorithmic}
+\end{algorithm}
+
+\paragraph{Peak selection (\code{picos\_columna}).} The reference code
+selects the repeating frames with
+\begin{center}
+\code{findpeaks(S(:,j), 'MinPeakHeight', t, 'MinPeakDistance', D,}\\
+\code{\ \ \ \ \ \ \ \ \ 'SortStr', 'descend', 'NPeaks', k)},
+\end{center}
+which belongs to the Signal Processing Toolbox. Since \code{core/} must be
+toolbox-free, the same behaviour is re-implemented:
+\begin{enumerate}[nosep]
+  \item a \emph{peak} is a sample strictly greater than both neighbours;
+        on a plateau only its first sample counts; the first and last
+        samples are never peaks;
+  \item only peaks with height $>t$ are kept;
+  \item in descending order of height, a peak is accepted and every
+        remaining candidate closer than $D$ frames to it is discarded;
+  \item at most $k$ peaks are returned.
+\end{enumerate}
+Since $S(j,j)=1$ is the global maximum of column $j$, the frame itself is
+the first peak accepted, except for $j=1$ and $j=m$, which are
+end points and therefore never peaks (identical to \code{findpeaks}). This has a useful consequence: its
+$D-1$ neighbours on each side are then discarded, so $d$ effectively
+excludes the frames that resemble $j$ only because the same note is still
+sounding.
+
+\paragraph{Channels.} The similarity matrix and the selected indices $J_j$
+are computed once on $\bar V$ (as in the reference code); the median
+model and the mask are computed on each channel's own $V_c$.
+
+\subsection{Parameters}
+\begin{table}[htbp]
+\centering
+\caption{REPET-SIM parameters (defaults from the authors' reference code).}
+\label{tab:repetsim}
+\begin{tabularx}{\linewidth}{@{}p{2.6cm}ccL@{}}
+\toprule
+Parameter & Default & UI range & Effect \\
+\midrule
+$k$, max.\ repeating frames & 100 & 3--500 & Number of frames (including $j$ itself) entering the median. More frames give a more robust model \emph{if} that many true repetitions exist; otherwise poorly matching frames enter and the background is over-estimated. With $k<3$ the median cannot reject anything. \\
+$d$, min.\ distance & 1 s & 0.1--10 s & Minimum separation between two selected frames. Larger $d$ prevents a long held note (including a sung one) from being matched with itself and called repeating, but limits the number of frames to $\lfloor (m-1)/D\rfloor+1$. Smaller $d$ lets sustained vocals leak into the background. \\
+$t$, min.\ similarity & 0 & 0--0.99 & Minimum cosine similarity to accept a frame. Raising it (0.6--0.8) keeps only real repetitions; in passages that do not repeat few frames remain, $U\approx V$, $M\approx1$, and nothing is extracted there. With $t=0$ any peak is accepted. \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\paragraph{Interaction between $k$ and $d$ on short fragments.} With
+$D=47$ frames ($d=1$ s at 48 kHz) and $m=939$ frames (20 s), at most
+$\lfloor 938/47\rfloor+1=20$ frames can be selected. Hence $k=100$ never
+acts on a 20 s fragment: the limit is set by $d$, and almost every region
+of the fragment enters every median. $k$ becomes relevant only for full
+songs.
+
+\paragraph{Diagnostics shown in the interface.} Average number of frames
+per median, the maximum that fits for the chosen $d$, the fraction of frames
+for which $k$ was the binding limit, and the mean similarity of the selected
+frames (excluding $j$ itself). A low mean similarity ($\approx0.5$--$0.7$)
+means the median is built from frames that are not real repetitions; the
+remedy is to raise $t$ or to analyse a longer excerpt.
+
+\subsection{Cost and limitations}
+\begin{itemize}
+  \item Time and memory are $O(m^2)$ because of $S$. A 3-minute song at
+        48 kHz with $R=1024$ has $m\approx8400$ frames, so $S$ alone takes
+        $\approx280$ MB in single precision (the reason $S$ is stored as
+        \code{single}).
+  \item As in REPET, a repeated vocal phrase is background, and
+        non-repeating instrumental fills fall on the foreground side.
+\end{itemize}
+
+% =====================================================================
+\section{Comparison of the two repetition filters}
+% =====================================================================
+
+\begin{table}[htbp]
+\centering
+\begin{tabularx}{\linewidth}{@{}lLL@{}}
+\toprule
+ & Original REPET & REPET-SIM \\
+\midrule
+Assumption & background repeats with one fixed period & background repeats, not necessarily periodically \\
+Frames in the median & one per segment, at multiples of $p$ & up to $k$ most similar frames, $\ge d$ apart \\
+Decision taken on & beat spectrum of $\bar V^{\,2}$ & cosine matrix of $\bar V$ \\
+Cost & $O(m\log m)$ & $O(m^2)$ \\
+Fails when & tempo or section changes & few true repetitions, or $d$ too small \\
+Diagnostics & beat spectrum, $p$, $r$, BPM & frames per median, mean similarity \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+REPET-SIM does not estimate any period, so it has no BPM; a tempo value
+would be a separate computation that the filter does not use.
+
+% =====================================================================
+\section{Consolidated list of deviations}
+\label{sec:deviations}
+% =====================================================================
+
+The guiding rule of the implementation is fidelity to the papers and to
+the authors' reference code. Every departure is listed here.
+
+\begin{table}[htbp]
+\centering
+\small
+\begin{tabularx}{\linewidth}{@{}p{2.1cm}p{3.6cm}LL@{}}
+\toprule
+Filter & Item & Paper / reference & This implementation and reason \\
+\midrule
+All & STFT & REPET reference: $2^{\lceil\log_2(0.04f_s)\rceil}=2048$ samples, 50\,\% overlap, Hamming. FitzGerald: 4096 / 1024. & Hann 4096, 75\,\%. One STFT is needed for all filters (masks are multiplied bin by bin); FitzGerald fixes his and reports better results with longer FFTs, the REPET papers do not fix one. The hop (1024) equals the reference's, so the frame rate and all parameters in seconds are unchanged. \\
+\addlinespace
+HPSS & Ties $H=P$ & Neither class & Percussive ($M_P=1-M_H$), to keep \cref{eq:unity} exact. \\
+HPSS & Median borders & Not specified & \code{movmedian} \code{'shrink'}. \\
+HPSS & Stereo & Mono only & One mask per channel. \\
+HPSS & Mask & Soft $p=2$ recommended & Binary only (soft pending). \\
+\addlinespace
+REPET / SIM & 100 Hz cut-off & Reference code forces $M=1$ below 100 Hz & Removed: not part of the papers. Low frequencies are classified by repetition only; a band limit on the component is the explicit alternative. \\
+REPET / SIM & Mask $\varepsilon$ & $M=W/V$ & $(W+\varepsilon)/(V+\varepsilon)$, as in the reference code. \\
+\addlinespace
+REPET & Stereo beat spectrum & Chapter text: average $V^2$ over channels & $(\bar V)^2$, as the reference code does. Note that $(\bar V)^2\neq\overline{V^2}$; it only affects the choice of $p$. \\
+REPET & Period index & Reference returns index of max $+\,p_{\min}$, i.e.\ lag $+1$ & Exact lag of the maximum; the search includes $\lfloor m/3\rfloor$. \\
+REPET & Short fragment ($3p_{\min}>m$) & Empty range in the reference & Search the whole valid range; warn if $r<3$. \\
+REPET & $b$ normalised by $b(0)$ & Yes & Same; only affects the plot. \\
+\addlinespace
+SIM & Peak picking & \code{findpeaks} (toolbox) & Own re-implementation with the same rules. \\
+SIM & Frame without peaks & Median of an empty set & $J_j=\{j\}\Rightarrow M=1$ (nothing extracted). \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+% =====================================================================
+\section{Verification}
+\label{sec:tests}
+% =====================================================================
+
+The tests in \code{tests/} use synthetic signals with known ground truth
+and are run headless with
+\code{matlab -batch "addpath('core','tests'); run\_tests"}.
+
+\begin{itemize}
+  \item \code{test\_hpss}: three sustained sines (440, 880, 1320 Hz) plus a
+        click every 0.5 s, stereo with different gains, at the paper's
+        setting (44.1 kHz, 4096/1024). Checks that the lengths are
+        $17\times17$ at 44.1 kHz and $19\times15$ at 48 kHz; that $M_H$ is
+        single, $n\times m\times C$, with values in $\{0,1\}$; that the mean
+        of $M_H$ is $>0.95$ on the sine bins and $<0.05$ on the click frames
+        (2--8 kHz) in both channels; and that a silent channel gives
+        $M_H=0$ with sustained + percussive $=1$ exactly.
+  \item \code{test\_repet\_original}: a 2.0 s loop repeated exactly, plus
+        five short non-repeating notes in their own bands, for 20 s and
+        19.3 s (non-integer number of periods), mono and stereo. Checks that
+        the detected period is 2.0 s (or an integer multiple) within one hop,
+        mask size and range, mean mask $>0.9$ on the loop and $<0.3$ on the
+        notes in every channel, the short-fragment case ($r<3$), and that the
+        four combinations add up to 1 (error $<10^{-5}$).
+  \item \code{test\_componentes}: 5 s of a real song with the default
+        settings and both repetition methods. Checks that the four
+        combinations add up to 1 and that applying all four components at
+        0 dB returns the original signal (error $<10^{-6}$).
+\end{itemize}
+
+These tests verify the implementation against its own specification and
+the papers' equations; they do not measure separation quality on real
+music, which must be assessed in the report (listening, spectrograms and
+the energy measurements).
+
+% =====================================================================
+\section{Open issues}
+% =====================================================================
+
+\begin{enumerate}
+  \item \textbf{Soft HPSS mask} (eqs.~10--11, $p=1,2$): the paper's
+        recommended setting is not yet available. Comparing binary and soft
+        masks is direct material for the discussion of side effects.
+  \item \textbf{Mixed mask types.} The voice component $M_H(1-M_R)$
+        combines a binary and a soft mask: the soft REPET weighting is
+        switched fully on or off by HPSS, so HPSS artefacts dominate at large
+        gains.
+  \item \textbf{Low-frequency behaviour.} With the 100 Hz cut-off removed
+        and the HPSS resolution limit below $\approx95$ Hz, the bass is the
+        least reliable region of every component; restricting the band of a
+        component is the explicit, reportable fix.
+  \item \textbf{Fragment length.} On 20 s fragments $k$ is inactive in
+        REPET-SIM and $p_{\max}$ is capped at $\approx6.7$ s in REPET; both
+        filters were designed for full tracks. This should be stated in the
+        report, or full songs should be analysed and the 20 s excerpt cut
+        afterwards.
+  \item \textbf{Adaptive REPET} (\S14.3) is not implemented.
+\end{enumerate}
+
+% =====================================================================
+\begin{thebibliography}{9}
+% =====================================================================
+\bibitem{fitzgerald2010}
+D.~FitzGerald, ``Harmonic/percussive separation using median filtering,''
+in \emph{Proc.\ 13th Int.\ Conf.\ on Digital Audio Effects (DAFx-10)},
+Graz, Austria, 2010.
+
+\bibitem{rafii2014}
+Z.~Rafii, A.~Liutkus, and B.~Pardo, ``REPET for background/foreground
+separation in audio,'' in G.~R.~Naik and W.~Wang (eds.), \emph{Blind
+Source Separation}, Signals and Communication Technology, ch.~14,
+pp.~395--411. Springer, 2014. doi:10.1007/978-3-642-55016-4\_14.
+
+\bibitem{rafii2013}
+Z.~Rafii and B.~Pardo, ``REpeating Pattern Extraction Technique (REPET):
+A simple method for music/voice separation,'' \emph{IEEE Trans.\ Audio,
+Speech, and Language Processing}, vol.~21, no.~1, pp.~71--82, 2013.
+
+\bibitem{rafii2012}
+Z.~Rafii and B.~Pardo, ``Music/voice separation using the similarity
+matrix,'' in \emph{Proc.\ 13th Int.\ Society for Music Information
+Retrieval Conf.\ (ISMIR)}, Porto, Portugal, 2012.
+
+\bibitem{griffin1984}
+D.~W.~Griffin and J.~S.~Lim, ``Signal estimation from modified short-time
+Fourier transform,'' \emph{IEEE Trans.\ Acoustics, Speech, and Signal
+Processing}, vol.~32, no.~2, pp.~236--243, 1984.
+\end{thebibliography}
+
+\end{document}
